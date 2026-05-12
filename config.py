@@ -80,3 +80,33 @@ SA_CONFIG = {
 def make_run_id(prefix: str = "run") -> str:
     """Generate a unique run ID based on current timestamp."""
     return f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}"
+
+
+# ── Optuna search space (populated by Section 6 range-derivation cell) ────────
+# Each entry has type ("int" | "float" | "categorical") and bounds/choices.
+# The numeric bounds (low/high) are None until the Section 6 closing cell runs
+# and derives them from the OAT experiment results automatically.
+OPTUNA_SEARCH_SPACE =  { "population_size": {"type": "int",         "low": 10, "high": 50},
+    "tournament_size": {"type": "int",         "low": 2, "high": 6},
+    "mut_prob":        {"type": "float",       "low": 0.01, "high": 0.1},
+    "xo_prob":         {"type": "float",       "low": 0.5, "high": 1.0},
+    "elitesize":       {"type": "int",         "low": 0, "high": 5},
+    "crossover_type":  {"type": "categorical", "choices": ["uniform", "single_point"]},
+    "mutation_type":   {"type": "categorical", "choices": ["random", "vertex_shift",
+                                                            "color_shift", "alpha_shift"]},
+}
+
+# ── Optuna-optimized configuration (filled in by Section 7 notebook cell) ─────
+# Replaces BEST_CONFIG as the canonical best parameters for all later sections.
+OPTUNA_BEST_CONFIG = {
+    "population_size"        : 40,
+    "max_generations"        : 1000,
+    "xo_prob"                : 0.8557,
+    "mut_prob"               : 0.0518,
+    "elitesize"              : 0,
+    "tournament_size"        : 5,
+    "crossover_type"         : "uniform",
+    "mutation_type"          : "random",
+    "maximization"           : False,
+    "save_image_every_n_gens": 100,
+}

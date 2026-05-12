@@ -40,12 +40,14 @@ def triangle_mutation(individual, mut_prob: float,
     individual : TriangleImageSolution
     mut_prob : float — probability that any given triangle is mutated.
     mutation_type : str — one of:
-        "vertex_shift"    small displacement of one vertex (±20 px)
+        "vertex_shift"    small displacement of one vertex (±30 px)
         "color_shift"     small change to one RGB channel (±30)
         "alpha_shift"     small change to alpha / transparency (±30)
         "triangle_replace" replace the entire triangle with a random one
         "triangle_swap"   swap the z-order of two random triangles
-        "random"          choose uniformly from all five operators per event
+        "random"          choose uniformly from vertex_shift, color_shift,
+                          alpha_shift (exploitation-only; avoids destructive
+                          triangle_replace / triangle_swap)
     verbose : bool
 
     Returns
@@ -58,8 +60,7 @@ def triangle_mutation(individual, mut_prob: float,
 
     new_repr = individual.repr.copy()
 
-    _OPERATORS = ["vertex_shift", "color_shift", "alpha_shift",
-                  "triangle_replace", "triangle_swap"]
+    _OPERATORS = ["vertex_shift", "color_shift", "alpha_shift"]
 
     i = 0
     while i < n_triangles:
@@ -95,7 +96,7 @@ def triangle_mutation(individual, mut_prob: float,
             axis   = random.randint(0, 1)
             gene   = base + vertex * 2 + axis
             bound  = img_w if axis == 0 else img_h
-            delta  = random.randint(-20, 20)
+            delta  = random.randint(-30, 30)
             new_repr[gene] = max(0, min(bound, new_repr[gene] + delta))
             if verbose:
                 print(f"vertex_shift: triangle {i}, vertex {vertex}, axis {'x' if axis==0 else 'y'}, delta={delta}")

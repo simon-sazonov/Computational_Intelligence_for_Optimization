@@ -21,7 +21,7 @@ Each consecutive block of 10 integers encodes one triangle:
     6      | R      | [0, 255]
     7      | G      | [0, 255]
     8      | B      | [0, 255]
-    9      | A      | [0, 255]  (alpha / transparency)
+    9      | A      | [20, 180] (initialised; avoids fully transparent or fully opaque)
 
 Triangle 0 is painted first (bottom layer); triangle 99 is on top.
 
@@ -89,7 +89,12 @@ class TriangleImageSolution(Solution):
         """Return a flat list of 1000 random integers within the gene bounds."""
         if self._BOUNDS is None:
             self._build_bounds()
-        return [random.randint(0, b) for b in self._BOUNDS]
+        repr_list = [random.randint(0, b) for b in self._BOUNDS]
+        # Alpha initialised to [20, 180] so every triangle contributes visibly
+        # from generation 1 without being fully opaque and blocking layers below.
+        for i in range(self.N_TRIANGLES):
+            repr_list[i * 10 + 9] = random.randint(20, 180)
+        return repr_list
 
     # ── GA interface ─────────────────────────────────────────────────────────
 
@@ -112,15 +117,13 @@ class TriangleImageSolution(Solution):
         Paint all 100 triangles onto a black RGBA canvas and return an RGB
         numpy array of shape (IMG_H, IMG_W, 3).
 
-        Triangles are composited in order: index 0 is the bottom-most layer,
-        index 99 is on top.  Alpha blending is handled by PIL's
-        alpha_composite, so a fully opaque triangle (A=255) completely covers
-        what is below it, while a transparent one (A=0) is invisible.
+        Each triangle is composited individually so that semi-transparent
+        triangles blend correctly with all layers beneath them.  Drawing all
+        triangles on one shared layer before compositing would cause them to
+        overwrite each other instead of blending (Porter-Duff Over operator
+        requires per-triangle compositing).
         """
         canvas = Image.new("RGBA", (self.IMG_W, self.IMG_H), (0, 0, 0, 255))
-        layer = Image.new("RGBA", (self.IMG_W, self.IMG_H), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(layer)
-
         genes = self.repr
         for i in range(self.N_TRIANGLES):
             base = i * 10
@@ -128,10 +131,9 @@ class TriangleImageSolution(Solution):
             x2, y2 = genes[base + 2], genes[base + 3]
             x3, y3 = genes[base + 4], genes[base + 5]
             r, g, b, a = genes[base + 6], genes[base + 7], genes[base + 8], genes[base + 9]
-
-            draw.polygon([(x1, y1), (x2, y2), (x3, y3)], fill=(r, g, b, a))
-
-        canvas = Image.alpha_composite(canvas, layer)
+            layer = Image.new("RGBA", (self.IMG_W, self.IMG_H), (0, 0, 0, 0))
+            ImageDraw.Draw(layer).polygon([(x1, y1), (x2, y2), (x3, y3)], fill=(r, g, b, a))
+            canvas = Image.alpha_composite(canvas, layer)
         return np.array(canvas.convert("RGB"), dtype=np.float32)
 
     # ── Fitness ───────────────────────────────────────────────────────────────
@@ -180,7 +182,7 @@ class TriangleImageSolution(Solution):
             axis   = random.randint(0, 1)           # x or y
             gene   = base + vertex * 2 + axis
             bound  = self.IMG_W if axis == 0 else self.IMG_H
-            delta  = random.randint(-20, 20)
+            delta  = random.randint(-30, 30)
             new_repr[gene] = max(0, min(bound, new_repr[gene] + delta))
 
         elif mutation == "color_shift":
