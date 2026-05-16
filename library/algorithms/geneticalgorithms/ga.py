@@ -1,292 +1,498 @@
 """
 Genetic Algorithm for the Triangle Image Problem.
 
-Structure
----------
-genetic_algorithm()   — main GA loop (adapted from P09's genetic_algorithm_tpclass)
-get_elite()           — copied verbatim from P09 library
-save_run_log()        — saves JSON log + image snapshots to results/
-load_all_runs()       — loads all JSON logs for comparison plots
-plot_runs()           — convenience plotting function for the notebook
+Public API
+----------
+genetic_algorithm(solution_class, cfg, selection_fn, xo_fn, mut_fn,
+                  run_id=None, verbose=False)
+    Main GA loop.  All hyperparameters and feature flags come from cfg.
 
-Design notes
-------------
-- The GA is minimization-only in this project (RMSE) but the maximization
-  flag is kept for interface compatibility with the practice library.
-- Fitness is evaluated lazily via the cached .fitness() on each Solution;
-  the algorithm never calls fitness() more times than necessary.
-- Each run is saved to results/run_<timestamp>/ with a log.json and PNG
-  snapshots every save_every_n_gens generations.
+load_or_run_ga(label, *, solution_class, cfg, selection_fn, xo_fn, mut_fn,
+               verbose=False, reuse_existing=True, results_dir='results')
+    Load a cached matching run from disk, or execute and persist.
+
+hybrid_ga_then_sa(solution_class, ga_cfg, sa_cfg, run_id=None, verbose=False)
+    Run GA (or load an existing run), then refine its best with SA.
+
+load_or_run_hybrid(label, *, solution_class, ga_cfg, sa_cfg,
+                   verbose=False, reuse_existing=True, results_dir='results')
+    Load a cached matching hybrid run from disk, or execute and persist.
+
+Supporting helpers
+------------------
+get_elite, record_stats, plateau_detected
+save_run_log, load_all_runs, load_run_log, find_latest_run, load_latest_run
+log_to_stats, build_logged_solution
+plot_fitness_over_generations, plot_diversity, plot_image_evolution
+find_plateau, scan_patience_grid
 """
 
 import os
 import json
+import re
 import time
-import random
 from copy import deepcopy
 from datetime import datetime
+from functools import partial
 
 import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
 
+from library.algorithms.geneticalgorithms.diversity import (
+    compute_fitness_metrics,
+    compute_pairwise_distance_stats,
+    compute_shared_fitness,
+)
+from library.algorithms.geneticalgorithms.selection import tournament_selection
+
 
 # ── Elite selection ───────────────────────────────────────────────────────────
 
-def get_elite(population: list, maximization: bool, elitesize: int) -> list:
-    """
-    Return the top-k individuals from the population sorted by fitness.
-
-    Copied from P09 practice library.
-
-    Parameters
-    ----------
-    population : list[Solution]
-    maximization : bool
-    elitesize : int — number of elite individuals to keep (0 = no elitism)
-
-    Returns
-    -------
-    list[Solution] — the elite individuals (deep copies NOT made; handle in GA loop)
-    """
-    if elitesize == 0:
+def get_elite(population: list, n: int, maximization: bool) -> list:
+    """Return the top-n individuals sorted by fitness."""
+    if n == 0:
         return []
-    sorted_pop = sorted(population, key=lambda ind: ind.fitness(), reverse=maximization)
-    return sorted_pop[:elitesize]
+    return sorted(population, key=lambda ind: ind.fitness(), reverse=maximization)[:n]
+
+
+# ── Stats recorder ────────────────────────────────────────────────────────────
+
+def record_stats(stats: dict, population: list, track_diversity: bool = True):
+    """Append one generation's metrics to stats."""
+    fm = compute_fitness_metrics(population)
+    stats['fitness_history'].append(fm['best'])
+    stats['mean_fitness_history'].append(fm['mean'])
+    stats['worst_fitness_history'].append(fm['worst'])
+    stats['variance_history'].append(fm['variance'])
+    stats['entropy_history'].append(fm['entropy'])
+    if track_diversity:
+        pd = compute_pairwise_distance_stats(population)
+        stats['mean_dist_history'].append(pd['mean_dist'])
+        stats['std_dist_history'].append(pd['std_dist'])
+    else:
+        stats['mean_dist_history'].append(float('nan'))
+        stats['std_dist_history'].append(float('nan'))
+
+
+# ── Plateau detection ─────────────────────────────────────────────────────────
+
+def plateau_detected(stats: dict, patience: int, min_delta: float) -> bool:
+    """Return True if best fitness improved by less than min_delta over the last patience gens."""
+    h = stats['fitness_history']
+    if len(h) <= patience:
+        return False
+    return (h[-(patience + 1)] - h[-1]) < min_delta
 
 
 # ── Main GA loop ───────────────────────────────────────────────────────────────
 
 def genetic_algorithm(
     solution_class,
-    population_size: int,
-    max_generations: int,
-    selection_algorithm,
-    xo_method,
-    mut_method,
-    maximization: bool = False,
-    xo_prob: float = 0.8,
-    mut_prob: float = 0.05,
-    elitesize: int = 1,
-    verbose: bool = False,
+    cfg: dict,
+    selection_fn,
+    xo_fn,
+    mut_fn,
     run_id: str = None,
-    save_every_n_gens: int = 100,
-    initial_population: list = None,
-    config: dict = None,
-    patience: int = None,
-    min_delta: float = 0.05,
+    verbose: bool = False,
 ):
     """
-    Run the Genetic Algorithm and optionally save results to disk.
+    Run the Genetic Algorithm.
 
     Parameters
     ----------
     solution_class : class
-        The Solution subclass to instantiate for random individuals
-        (must implement random_initial_representation and with_repr).
-    population_size : int
-    max_generations : int
-    selection_algorithm : callable — e.g. tournament_selection
-    xo_method : callable — e.g. uniform_triangle_crossover
-    mut_method : callable — e.g. triangle_mutation
-    maximization : bool — False for RMSE minimization
-    xo_prob : float — probability of crossover occurring (per pair)
-    mut_prob : float — probability of mutating each triangle
-    elitesize : int — number of elite individuals carried over unchanged
-    verbose : bool — print progress every 50 generations
-    run_id : str | None — if provided, saves logs to results/<run_id>/
-    save_every_n_gens : int — save PNG snapshot every N generations
-    initial_population : list | None — if None, population is randomly initialised
-    config : dict | None — hyperparameter dict saved into the JSON log
-    patience : int | None — early stopping: number of generations to look back
-        when measuring improvement.  None disables early stopping (default).
-        If the best fitness has not improved by more than `min_delta` over the
-        last `patience` generations, the run stops early.
-    min_delta : float — minimum RMSE improvement required over `patience`
-        generations to continue (default 0.05).
+    cfg : dict
+        All hyperparameters and feature flags.  Keys consumed:
+
+        population_size      int    30
+        max_generations      int    1000
+        xo_prob              float  0.8
+        mut_prob             float  0.05
+        elitesize            int    1
+        maximization         bool   False
+        save_image_every_n_gens int 100
+
+        track_diversity      bool   True   — log diversity metrics each generation
+        fitness_sharing      bool   False
+        sigma_share          float  0.1    — niche radius
+        dynamic_schedule     bool   False  — linear param decay
+        mut_prob_start       float  mut_prob
+        mut_prob_end         float  mut_prob
+        tournament_start     int    3
+        tournament_end       int    3
+        innovation_replace_prob float 0.0  — per-triangle randomisation
+        zorder_swap_prob     float  0.0    — per-individual z-swap
+        vertex_step          int    30
+        color_step           int    30
+        alpha_step           int    30
+        patience             int    None   — early stopping look-back
+        min_delta            float  0.05   — min improvement over patience gens
+
+    selection_fn : callable — e.g. partial(tournament_selection, tournament_size=3)
+    xo_fn        : callable — e.g. uniform_triangle_crossover
+    mut_fn       : callable — e.g. triangle_mutation
 
     Returns
     -------
     best_individual : Solution
-    fitness_history : list[float] — best fitness at end of each generation
+    stats : dict with keys fitness_history, mean_fitness_history, worst_fitness_history,
+            variance_history, entropy_history, mean_dist_history, std_dist_history,
+            cumulative_evals, stopped_early_at
     """
-    # ── Initialise population ────────────────────────────────────────────────
-    if initial_population is not None:
-        population = list(initial_population)
-    else:
-        population = [solution_class() for _ in range(population_size)]
+    population_size   = cfg['population_size']
+    max_generations   = cfg['max_generations']
+    xo_prob           = cfg['xo_prob']
+    mut_prob          = cfg['mut_prob']
+    elitesize         = cfg.get('elitesize', 1)
+    maximization      = cfg.get('maximization', False)
+    save_every        = cfg.get('save_image_every_n_gens', 100)
+    track_diversity   = cfg.get('track_diversity', True)
+    use_sharing       = cfg.get('fitness_sharing', False)
+    sigma_share       = cfg.get('sigma_share', 0.1)
+    dynamic_schedule  = cfg.get('dynamic_schedule', False)
+    mut_start         = cfg.get('mut_prob_start', mut_prob)
+    mut_end           = cfg.get('mut_prob_end', mut_prob)
+    tourn_start       = cfg.get('tournament_start', cfg.get('tournament_size', 3))
+    tourn_end         = cfg.get('tournament_end',   cfg.get('tournament_size', 3))
+    innov_replace     = cfg.get('innovation_replace_prob', 0.0)
+    zorder_swap       = cfg.get('zorder_swap_prob', 0.0)
+    vertex_step       = cfg.get('vertex_step', 30)
+    color_step        = cfg.get('color_step', 30)
+    alpha_step        = cfg.get('alpha_step', 30)
+    patience          = cfg.get('patience', None)
+    min_delta         = cfg.get('min_delta', 0.05)
 
-    fitness_history = []
+    population = [solution_class() for _ in range(population_size)]
+
+    stats = {
+        'fitness_history':       [],
+        'mean_fitness_history':  [],
+        'worst_fitness_history': [],
+        'variance_history':      [],
+        'entropy_history':       [],
+        'mean_dist_history':     [],
+        'std_dist_history':      [],
+        'cumulative_evals':      [population_size],
+        'stopped_early_at':      None,
+    }
+
     start_time = time.time()
-    stopped_early_at = None
-
-    # Set up run logging folder
     run_dir = None
     if run_id is not None:
-        run_dir = os.path.join("results", run_id)
+        run_dir = os.path.join('results', run_id)
         os.makedirs(run_dir, exist_ok=True)
 
-    # ── Generation loop ──────────────────────────────────────────────────────
     for gen in range(max_generations):
 
-        # 1. Elitism — carry over the best individuals unchanged
-        elite = get_elite(population, maximization, elitesize)
-        new_population = [deepcopy(ind) for ind in elite]
+        # 1. Dynamic schedule
+        if dynamic_schedule:
+            t            = gen / max_generations
+            cur_mut_prob = mut_start + t * (mut_end - mut_start)
+            cur_tourn    = max(2, round(tourn_start + t * (tourn_end - tourn_start)))
+            cur_sel      = partial(tournament_selection, tournament_size=cur_tourn)
+            cur_vertex   = vertex_step   # step sizes held constant; override via cfg if needed
+            cur_color    = color_step
+            cur_alpha    = alpha_step
+        else:
+            cur_mut_prob = mut_prob
+            cur_sel      = selection_fn
+            cur_vertex   = vertex_step
+            cur_color    = color_step
+            cur_alpha    = alpha_step
 
-        # 2. Fill the rest of the population with offspring
-        while len(new_population) < population_size:
-            parent1 = selection_algorithm(population, maximization)
-            parent2 = selection_algorithm(population, maximization)
+        # 2. Fitness sharing
+        shared = compute_shared_fitness(population, sigma_share) if use_sharing else None
 
-            offspring1, offspring2 = xo_method(parent1, parent2, xo_prob)
-            offspring1 = mut_method(offspring1, mut_prob)
-            offspring2 = mut_method(offspring2, mut_prob)
+        # 3. Elitism
+        elite      = get_elite(population, elitesize, maximization)
+        new_pop    = [deepcopy(ind) for ind in elite]
 
-            new_population.append(offspring1)
-            if len(new_population) < population_size:
-                new_population.append(offspring2)
+        # 4. Generate offspring
+        while len(new_pop) < population_size:
+            p1 = cur_sel(population, maximization, fitness_override=shared)
+            p2 = cur_sel(population, maximization, fitness_override=shared)
+            c1, c2 = xo_fn(p1, p2, xo_prob)
+            c1 = mut_fn(c1, cur_mut_prob,
+                        vertex_step=int(cur_vertex), color_step=int(cur_color),
+                        alpha_step=int(cur_alpha),
+                        innovation_replace_prob=innov_replace,
+                        zorder_swap_prob=zorder_swap)
+            c2 = mut_fn(c2, cur_mut_prob,
+                        vertex_step=int(cur_vertex), color_step=int(cur_color),
+                        alpha_step=int(cur_alpha),
+                        innovation_replace_prob=innov_replace,
+                        zorder_swap_prob=zorder_swap)
+            new_pop.append(c1)
+            if len(new_pop) < population_size:
+                new_pop.append(c2)
 
-        population = new_population
+        population = new_pop[:population_size]
 
-        # 3. Track best fitness this generation
-        best_ind = get_elite(population, maximization, 1)[0]
-        best_fitness = best_ind.fitness()
-        fitness_history.append(best_fitness)
+        # 5. Record statistics
+        record_stats(stats, population, track_diversity)
+        stats['cumulative_evals'].append(stats['cumulative_evals'][-1] + population_size - elitesize)
 
-        # 4. Verbose logging
+        # 6. Verbose logging
         if verbose and (gen == 0 or (gen + 1) % 50 == 0):
             elapsed = time.time() - start_time
-            print(f"Generation {gen + 1:4d}/{max_generations} | "
-                  f"Best RMSE: {best_fitness:.4f} | "
+            dist_str = (f" | MeanDist: {stats['mean_dist_history'][-1]:.1f}"
+                        if track_diversity else "")
+            print(f"Gen {gen+1:4d}/{max_generations} | "
+                  f"Best RMSE: {stats['fitness_history'][-1]:.4f}{dist_str} | "
                   f"Elapsed: {elapsed:.1f}s")
 
-        # 5. Save image snapshot
-        if run_dir is not None and (gen == 0 or (gen + 1) % save_every_n_gens == 0):
-            img_array = best_ind.draw_image().astype(np.uint8)
-            img = Image.fromarray(img_array)
-            img.save(os.path.join(run_dir, f"gen_{gen + 1:04d}.png"))
+        # 7. Save image snapshot
+        if run_dir is not None and (gen == 0 or (gen + 1) % save_every == 0):
+            best_snap = get_elite(population, 1, maximization)[0]
+            img = Image.fromarray(best_snap.draw_image().astype(np.uint8))
+            img.save(os.path.join(run_dir, f"gen_{gen+1:04d}.png"))
 
-        # 6. Early stopping — check plateau once we have enough history
-        if patience is not None and (gen + 1) > patience:
-            improvement = fitness_history[-(patience + 1)] - fitness_history[-1]
-            if not maximization:
-                plateau = improvement < min_delta
-            else:
-                plateau = improvement < min_delta
-            if plateau:
-                stopped_early_at = gen + 1
-                if verbose:
-                    print(f"\n[Early stop] Plateau detected at generation {stopped_early_at}. "
-                          f"Improvement over last {patience} gens: {improvement:.4f} < "
-                          f"min_delta={min_delta}")
-                # Save final snapshot
-                if run_dir is not None:
-                    img_array = best_ind.draw_image().astype(np.uint8)
-                    Image.fromarray(img_array).save(
-                        os.path.join(run_dir, f"gen_{gen + 1:04d}_final.png")
-                    )
-                break
+        # 8. Early stopping
+        if patience is not None and plateau_detected(stats, patience, min_delta):
+            stats['stopped_early_at'] = gen + 1
+            if verbose:
+                print(f"\n[Early stop] Plateau at generation {gen+1}.")
+            if run_dir is not None:
+                best_snap = get_elite(population, 1, maximization)[0]
+                Image.fromarray(best_snap.draw_image().astype(np.uint8)).save(
+                    os.path.join(run_dir, f"gen_{gen+1:04d}_final.png")
+                )
+            break
 
-    # ── Final best individual ────────────────────────────────────────────────
-    final_best = get_elite(population, maximization, 1)[0]
-    runtime = time.time() - start_time
+    final_best = get_elite(population, 1, maximization)[0]
+    runtime    = time.time() - start_time
 
-    # ── Save JSON log ────────────────────────────────────────────────────────
     if run_dir is not None:
-        save_run_log(
-            run_dir, config or {}, fitness_history, runtime, final_best.fitness(),
-            stopped_early_at=stopped_early_at,
+        Image.fromarray(final_best.draw_image().astype(np.uint8)).save(
+            os.path.join(run_dir, f"gen_{len(stats['fitness_history']):04d}_final.png")
         )
+        save_run_log(run_dir, cfg, stats, runtime, final_best.fitness(),
+                     stopped_early_at=stats['stopped_early_at'],
+                     best_repr=getattr(final_best, 'repr', None))
 
     if verbose:
-        if stopped_early_at:
-            print(f"\nDone (early stop at gen {stopped_early_at}). "
-                  f"Best RMSE: {final_best.fitness():.4f} | Total time: {runtime:.1f}s")
-        else:
-            print(f"\nDone. Best RMSE: {final_best.fitness():.4f} | Total time: {runtime:.1f}s")
+        tag = f"early stop at gen {stats['stopped_early_at']}" if stats['stopped_early_at'] else "done"
+        print(f"\nGA {tag}. Best RMSE: {final_best.fitness():.4f} | Time: {runtime:.1f}s")
 
-    return final_best, fitness_history
+    return final_best, stats
 
 
 # ── Run logging ───────────────────────────────────────────────────────────────
 
-def save_run_log(run_dir: str, config: dict, fitness_history: list,
-                 runtime: float, final_fitness: float, stopped_early_at: int = None):
-    """Save experiment metadata and fitness history to results/<run_id>/log.json."""
+def save_run_log(run_dir, cfg, stats, runtime, final_fitness,
+                 stopped_early_at=None, best_repr=None):
+    """Save experiment metadata and fitness/diversity histories to log.json."""
+    def _round(lst):
+        return [round(v, 6) if v == v else None for v in lst]  # NaN → None
+
     log = {
-        "timestamp": datetime.now().isoformat(),
-        "config": config,
-        "runtime_seconds": round(runtime, 2),
-        "final_fitness": round(final_fitness, 6),
-        "fitness_history": [round(f, 6) for f in fitness_history],
-        "n_generations": len(fitness_history),
-        "stopped_early_at": stopped_early_at,
+        'timestamp':        datetime.now().isoformat(),
+        'algorithm':        'genetic_algorithm',
+        'config':           cfg,
+        'runtime_seconds':  round(runtime, 2),
+        'final_fitness':    round(final_fitness, 6),
+        'n_generations':    len(stats['fitness_history']),
+        'stopped_early_at': stopped_early_at,
+        'fitness_history':         _round(stats['fitness_history']),
+        'mean_fitness_history':    _round(stats['mean_fitness_history']),
+        'worst_fitness_history':   _round(stats['worst_fitness_history']),
+        'variance_history':        _round(stats['variance_history']),
+        'entropy_history':         _round(stats['entropy_history']),
+        'mean_dist_history':       _round(stats['mean_dist_history']),
+        'std_dist_history':        _round(stats['std_dist_history']),
+        'cumulative_evals':        stats['cumulative_evals'],
     }
-    log_path = os.path.join(run_dir, "log.json")
-    with open(log_path, "w") as f:
+    if best_repr is not None:
+        log['best_repr'] = list(best_repr)
+    with open(os.path.join(run_dir, 'log.json'), 'w') as f:
         json.dump(log, f, indent=2)
 
 
-def load_all_runs(results_dir: str = "results") -> list:
-    """
-    Load all log.json files from results/ and return a list of log dicts.
-
-    Each dict contains 'config', 'fitness_history', 'final_fitness', etc.
-    Use this in the notebook to compare runs from different hyperparameter
-    configurations.
-    """
+def load_all_runs(results_dir: str = 'results') -> list:
+    """Load all log.json files from results/ and return a list of log dicts."""
     logs = []
     if not os.path.isdir(results_dir):
         return logs
     for run_name in sorted(os.listdir(results_dir)):
-        log_path = os.path.join(results_dir, run_name, "log.json")
+        log_path = os.path.join(results_dir, run_name, 'log.json')
         if os.path.isfile(log_path):
             with open(log_path) as f:
                 data = json.load(f)
-            data["run_name"] = run_name
+            data['run_name'] = run_name
             logs.append(data)
     return logs
+
+
+def load_run_log(run_name: str, results_dir: str = 'results') -> dict | None:
+    """Load one saved run by exact directory name."""
+    log_path = os.path.join(results_dir, run_name, 'log.json')
+    if not os.path.isfile(log_path):
+        return None
+    with open(log_path) as f:
+        data = json.load(f)
+    data['run_name'] = run_name
+    data['run_dir']  = os.path.join(results_dir, run_name)
+    return data
+
+
+def find_latest_run(prefix: str, results_dir: str = 'results') -> str | None:
+    """Return the most recent run directory whose name starts with prefix."""
+    if not os.path.isdir(results_dir):
+        return None
+    candidates = [
+        name for name in os.listdir(results_dir)
+        if os.path.isdir(os.path.join(results_dir, name))
+        and (name == prefix or name.startswith(f"{prefix}_"))
+        and os.path.isfile(os.path.join(results_dir, name, 'log.json'))
+    ]
+    return sorted(candidates)[-1] if candidates else None
+
+
+def load_latest_run(prefix: str, results_dir: str = 'results') -> dict | None:
+    """Load the newest matching run for a given prefix."""
+    run_name = find_latest_run(prefix, results_dir)
+    return load_run_log(run_name, results_dir) if run_name else None
+
+
+def log_to_stats(log: dict) -> dict:
+    """Normalise a persisted log into the stats dict shape used in notebooks."""
+    return {
+        'fitness_history':       list(log.get('fitness_history', [])),
+        'mean_fitness_history':  list(log.get('mean_fitness_history', [])),
+        'worst_fitness_history': list(log.get('worst_fitness_history', [])),
+        'variance_history':      list(log.get('variance_history', [])),
+        'entropy_history':       list(log.get('entropy_history', [])),
+        'mean_dist_history':     list(log.get('mean_dist_history', [])),
+        'std_dist_history':      list(log.get('std_dist_history', [])),
+        'cumulative_evals':      list(log.get('cumulative_evals', [])),
+        'stopped_early_at':      log.get('stopped_early_at'),
+    }
+
+
+def _latest_snapshot_path(run_dir: str) -> str | None:
+    if not os.path.isdir(run_dir):
+        return None
+    pngs = [n for n in os.listdir(run_dir) if n.endswith('.png')]
+    if not pngs:
+        return None
+    def _key(name):
+        m = re.search(r'(\d+)', name)
+        return (int(m.group(1)) if m else -1, 1 if '_final' in name else 0, name)
+    return os.path.join(run_dir, sorted(pngs, key=_key)[-1])
+
+
+class _LoggedRunSolution:
+    """Lightweight proxy for a saved run when the full Solution object is unavailable."""
+    def __init__(self, fitness_value, image_path=None, repr_list=None, solution_class=None):
+        self._fitness        = float(fitness_value)
+        self._image_path     = image_path
+        self._repr           = list(repr_list) if repr_list is not None else None
+        self._solution_class = solution_class
+
+    def fitness(self): return self._fitness
+
+    def show(self, title=None, ax=None):
+        import matplotlib.pyplot as plt
+        if self._repr is not None and self._solution_class is not None:
+            return self._solution_class(repr=list(self._repr)).show(title=title, ax=ax)
+        if self._image_path is None or not os.path.isfile(self._image_path):
+            raise FileNotFoundError("No saved image snapshot available for this logged run.")
+        standalone = ax is None
+        if standalone:
+            _, ax = plt.subplots(figsize=(4, 5))
+        ax.imshow(Image.open(self._image_path).convert('RGB'))
+        ax.set_title(title or f"RMSE = {self._fitness:.4f}")
+        ax.axis('off')
+        if standalone:
+            plt.tight_layout(); plt.show()
+
+    def __repr__(self):
+        return f"LoggedRunSolution(fitness={self._fitness:.4f})"
+
+
+def build_logged_solution(log: dict, solution_class=None):
+    """Rebuild a saved run as the true Solution object or a display proxy."""
+    repr_list = log.get('best_repr')
+    if repr_list is not None and solution_class is not None:
+        return solution_class(repr=list(repr_list))
+    run_dir = log.get('run_dir') or os.path.join('results', log['run_name'])
+    return _LoggedRunSolution(
+        fitness_value=log['final_fitness'],
+        image_path=_latest_snapshot_path(run_dir),
+        repr_list=repr_list,
+        solution_class=solution_class,
+    )
+
+
+# ── load_or_run_ga ────────────────────────────────────────────────────────────
+
+def load_or_run_ga(
+    label: str,
+    *,
+    solution_class,
+    cfg: dict,
+    selection_fn,
+    xo_fn,
+    mut_fn,
+    verbose: bool = False,
+    reuse_existing: bool = True,
+    results_dir: str = 'results',
+):
+    """
+    Load the newest matching GA run from disk, or execute and persist it.
+
+    Parameters
+    ----------
+    label : str — prefix for the run directory (e.g. "ga_baseline")
+    solution_class, cfg, selection_fn, xo_fn, mut_fn — passed to genetic_algorithm
+    verbose : bool
+    reuse_existing : bool — if True and a matching run exists on disk, skip re-running
+    results_dir : str — root results directory (default "results")
+
+    Returns
+    -------
+    solution, stats, run_name, log, was_run : bool
+    """
+    from config import make_run_id
+
+    if reuse_existing:
+        log = load_latest_run(label, results_dir)
+        if log is not None:
+            return (
+                build_logged_solution(log, solution_class),
+                log_to_stats(log),
+                log['run_name'],
+                log,
+                False,
+            )
+
+    run_name = make_run_id(label)
+    best, stats = genetic_algorithm(
+        solution_class=solution_class,
+        cfg=cfg,
+        selection_fn=selection_fn,
+        xo_fn=xo_fn,
+        mut_fn=mut_fn,
+        run_id=run_name,
+        verbose=verbose,
+    )
+    log = load_run_log(run_name, results_dir)
+    return best, stats, run_name, log, True
 
 
 # ── Plateau analysis ─────────────────────────────────────────────────────────
 
 def find_plateau(fitness_history: list, patience: int, min_delta: float) -> int | None:
-    """
-    Retrospectively scan a completed fitness history and return the generation
-    at which early stopping WOULD have triggered for given (patience, min_delta).
-
-    Useful for calibrating stopping parameters without re-running the GA.
-
-    Parameters
-    ----------
-    fitness_history : list[float] — one value per generation (from log.json)
-    patience : int — look-back window in generations
-    min_delta : float — minimum improvement required over that window
-
-    Returns
-    -------
-    int — generation number (1-indexed) where stopping would fire, or
-    None if the run would never have stopped early.
-    """
+    """Return the generation at which early stopping would have triggered."""
     for g in range(patience, len(fitness_history)):
-        improvement = fitness_history[g - patience] - fitness_history[g]
-        if improvement < min_delta:
-            return g + 1   # 1-indexed generation number
+        if (fitness_history[g - patience] - fitness_history[g]) < min_delta:
+            return g + 1
     return None
 
 
-def scan_patience_grid(
-    fitness_history: list,
-    patience_values: list,
-    min_delta_values: list,
-) -> list:
-    """
-    Evaluate a grid of (patience, min_delta) combinations on one fitness history.
-
-    Returns a list of dicts with keys: patience, min_delta, stop_gen, rmse_at_stop,
-    final_rmse, gens_saved, pct_saved.  Useful for choosing stopping parameters
-    before running new experiments.
-    """
+def scan_patience_grid(fitness_history, patience_values, min_delta_values) -> list:
+    """Evaluate a grid of (patience, min_delta) on one fitness history."""
     final_rmse = fitness_history[-1]
     total_gens = len(fitness_history)
     results = []
@@ -295,88 +501,313 @@ def scan_patience_grid(
             stop_gen = find_plateau(fitness_history, pat, delta)
             if stop_gen is not None:
                 rmse_at_stop = fitness_history[stop_gen - 1]
-                gens_saved = total_gens - stop_gen
-                pct_saved = 100 * gens_saved / total_gens
+                gens_saved   = total_gens - stop_gen
+                pct_saved    = 100 * gens_saved / total_gens
             else:
                 rmse_at_stop = final_rmse
-                gens_saved = 0
-                pct_saved = 0.0
+                gens_saved   = 0
+                pct_saved    = 0.0
             results.append({
-                "patience": pat,
-                "min_delta": delta,
-                "stop_gen": stop_gen,
-                "rmse_at_stop": round(rmse_at_stop, 4) if stop_gen else None,
-                "final_rmse": round(final_rmse, 4),
-                "gens_saved": gens_saved,
-                "pct_saved": round(pct_saved, 1),
+                'patience':    pat,
+                'min_delta':   delta,
+                'stop_gen':    stop_gen,
+                'rmse_at_stop': round(rmse_at_stop, 4) if stop_gen else None,
+                'final_rmse':  round(final_rmse, 4),
+                'gens_saved':  gens_saved,
+                'pct_saved':   round(pct_saved, 1),
             })
     return results
 
 
 # ── Plotting ──────────────────────────────────────────────────────────────────
 
-def plot_fitness_over_generations(
-    fitness_histories: list,
-    labels: list = None,
-    title: str = "Fitness over Generations",
-    figsize: tuple = (10, 5),
-):
-    """
-    Plot one or more fitness curves on the same axes.
-
-    Parameters
-    ----------
-    fitness_histories : list[list[float]]
-        Each inner list is the fitness_history from one GA run.
-    labels : list[str] | None
-        Legend labels (one per history).
-    title : str
-    figsize : tuple
-    """
+def plot_fitness_over_generations(fitness_histories, labels=None,
+                                  title='Fitness over Generations', figsize=(10, 5)):
+    """Plot one or more fitness curves on the same axes."""
     fig, ax = plt.subplots(figsize=figsize)
-    labels = labels or [f"Run {i+1}" for i in range(len(fitness_histories))]
-
+    labels = labels or [f'Run {i+1}' for i in range(len(fitness_histories))]
     for history, label in zip(fitness_histories, labels):
         ax.plot(history, label=label, linewidth=1.5)
-
-    ax.set_xlabel("Generation")
-    ax.set_ylabel("Best RMSE (lower is better)")
+    ax.set_xlabel('Generation')
+    ax.set_ylabel('Best RMSE (lower is better)')
     ax.set_title(title)
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    ax.legend(); ax.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.show()
+    return fig
+
+
+def plot_diversity(stats: dict, title: str = 'Population Diversity Diagnostics'):
+    """2×2 diagnostic panel: fitness spread, pairwise distance, variance, entropy."""
+    gens = range(1, len(stats['fitness_history']) + 1)
+    fig, axes = plt.subplots(2, 2, figsize=(13, 8))
+    fig.suptitle(title, fontsize=13)
+
+    ax = axes[0, 0]
+    ax.plot(gens, stats['fitness_history'],       label='Best',  color='steelblue',  lw=1.5)
+    ax.plot(gens, stats['mean_fitness_history'],  label='Mean',  color='darkorange', lw=1.2, ls='--')
+    ax.plot(gens, stats['worst_fitness_history'], label='Worst', color='tomato',     lw=1.0, ls=':')
+    ax.set_xlabel('Generation'); ax.set_ylabel('RMSE')
+    ax.set_title('Fitness: best / mean / worst')
+    ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+
+    ax = axes[0, 1]
+    mean_d = np.array(stats['mean_dist_history'])
+    std_d  = np.array(stats['std_dist_history'])
+    ax.plot(gens, mean_d, color='mediumseagreen', lw=1.5, label='Mean pairwise dist')
+    ax.fill_between(gens, mean_d - std_d, mean_d + std_d, alpha=0.2, color='mediumseagreen')
+    ax.set_xlabel('Generation'); ax.set_ylabel('Euclidean distance')
+    ax.set_title('Genotypic diversity — mean pairwise distance ± std')
+    ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+
+    ax = axes[1, 0]
+    ax.plot(gens, stats['variance_history'], color='mediumpurple', lw=1.5)
+    ax.set_xlabel('Generation'); ax.set_ylabel('Variance')
+    ax.set_title('Phenotypic variance of RMSE')
+    ax.grid(True, alpha=0.3)
+
+    ax = axes[1, 1]
+    ax.plot(gens, stats['entropy_history'], color='goldenrod', lw=1.5)
+    ax.set_xlabel('Generation'); ax.set_ylabel('Entropy (nats)')
+    ax.set_title('Phenotypic entropy of RMSE')
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
     return fig
 
 
 def plot_image_evolution(run_dir: str, figsize: tuple = (16, 4)):
-    """
-    Display the saved PNG snapshots from a run in a single row.
-
-    Parameters
-    ----------
-    run_dir : str — path to results/<run_id>/
-    """
-    snapshots = sorted(
-        [f for f in os.listdir(run_dir) if f.endswith(".png")]
-    )
+    """Display saved PNG snapshots from a run in a single row."""
+    snapshots = sorted(f for f in os.listdir(run_dir) if f.endswith('.png'))
     if not snapshots:
-        print(f"No PNG snapshots found in {run_dir}")
+        print(f"No PNG snapshots in {run_dir}")
         return
-
     n = len(snapshots)
     fig, axes = plt.subplots(1, n, figsize=figsize)
     if n == 1:
         axes = [axes]
-
     for ax, fname in zip(axes, snapshots):
         img = Image.open(os.path.join(run_dir, fname))
-        gen_num = fname.replace("gen_", "").replace(".png", "")
-        ax.imshow(img)
-        ax.set_title(f"Gen {int(gen_num)}")
-        ax.axis("off")
-
+        gen_num = fname.replace('gen_', '').replace('.png', '').replace('_final', '')
+        try:
+            ax.set_title(f"Gen {int(gen_num)}")
+        except ValueError:
+            ax.set_title(fname)
+        ax.imshow(img); ax.axis('off')
     plt.suptitle(f"Image evolution — {run_dir}", fontsize=12)
     plt.tight_layout()
     plt.show()
     return fig
+
+
+# ── Hybrid GA → SA ────────────────────────────────────────────────────────────
+
+def hybrid_ga_then_sa(
+    solution_class,
+    ga_cfg: dict,
+    sa_cfg: dict,
+    run_id: str = None,
+    verbose: bool = False,
+):
+    """
+    Run GA, then refine its best individual with SA.
+
+    The GA does global exploration; SA polishes the result with local search.
+    Typical budget split: 80 % GA evals, 20 % SA evals.
+
+    Parameters
+    ----------
+    solution_class : class
+    ga_cfg : dict  — full GA config (same keys as genetic_algorithm's cfg).
+    sa_cfg : dict  — SA refinement config.  Use lower C than standalone SA
+                     (e.g. 2–5 instead of 20) so SA does not undo GA's work.
+                     Keys: C, L, H, max_iter, save_every_n_steps.
+    run_id : str | None
+        If set, saves GA artefacts under results/<run_id>/ga/ and SA artefacts
+        under results/<run_id>/sa/, and writes a combined log.json.
+    verbose : bool
+
+    Returns
+    -------
+    best_sa : Solution
+    info : dict
+        ga_history      — best RMSE per GA generation
+        sa_history      — best RMSE per SA outer cycle
+        combined_history — ga_history + sa_history (single-axis plotting)
+        ga_final_rmse
+        sa_final_rmse
+    """
+    from functools import partial as _partial
+    from library.algorithms.geneticalgorithms.crossover import (
+        uniform_triangle_crossover, single_point_triangle_crossover,
+    )
+    from library.algorithms.geneticalgorithms.mutation import triangle_mutation
+    from library.algorithms.geneticalgorithms.selection import tournament_selection
+    from library.algorithms.simulated_annealing import simulated_annealing
+
+    _XO_MAP = {
+        'uniform':      uniform_triangle_crossover,
+        'single_point': single_point_triangle_crossover,
+    }
+
+    run_dir    = None
+    ga_run_id  = None
+    sa_run_id  = None
+    if run_id is not None:
+        run_dir   = os.path.join('results', run_id)
+        os.makedirs(run_dir, exist_ok=True)
+        ga_run_id = f"{run_id}/ga"
+        sa_run_id = f"{run_id}/sa"
+
+    # Phase 1 ─ GA
+    xo_fn  = _XO_MAP.get(ga_cfg.get('crossover_type', 'uniform'), uniform_triangle_crossover)
+    sel_fn = _partial(tournament_selection,
+                      tournament_size=ga_cfg.get('tournament_size', 3))
+
+    t0 = time.time()
+    if verbose:
+        print(f"[Hybrid] Phase 1: GA  (pop={ga_cfg.get('population_size')}  "
+              f"gens={ga_cfg.get('max_generations')}) ...")
+
+    best_ga, ga_stats = genetic_algorithm(
+        solution_class=solution_class,
+        cfg=ga_cfg,
+        selection_fn=sel_fn,
+        xo_fn=xo_fn,
+        mut_fn=triangle_mutation,
+        run_id=ga_run_id,
+        verbose=verbose,
+    )
+
+    ga_rmse = best_ga.fitness()
+    if verbose:
+        print(f"[Hybrid] GA done — RMSE {ga_rmse:.4f}  ({time.time()-t0:.1f}s)")
+
+    # Phase 2 ─ SA refinement
+    if verbose:
+        sa_evals = sa_cfg['L'] * sa_cfg['max_iter']
+        print(f"[Hybrid] Phase 2: SA  (L={sa_cfg['L']}  "
+              f"outer={sa_cfg['max_iter']}  evals={sa_evals}) ...")
+
+    best_sa, sa_history = simulated_annealing(
+        initial_solution=best_ga,
+        C=sa_cfg['C'],
+        L=sa_cfg['L'],
+        H=sa_cfg['H'],
+        maximization=False,
+        max_iter=sa_cfg['max_iter'],
+        verbose=verbose,
+        run_id=sa_run_id,
+        save_every_n_steps=sa_cfg.get('save_every_n_steps', 500),
+        config=sa_cfg,
+    )
+
+    sa_rmse     = best_sa.fitness()
+    total_time  = time.time() - t0
+    if verbose:
+        print(f"[Hybrid] SA done — RMSE {sa_rmse:.4f}  "
+              f"(improvement {ga_rmse - sa_rmse:.4f})  total {total_time:.1f}s")
+
+    # Persist combined log + final image
+    if run_dir is not None:
+        _save_hybrid_log(run_dir, ga_cfg, sa_cfg,
+                         ga_stats['fitness_history'], sa_history,
+                         ga_rmse, sa_rmse, total_time,
+                         best_repr=getattr(best_sa, 'repr', None))
+        Image.fromarray(best_sa.draw_image().astype(np.uint8)).save(
+            os.path.join(run_dir, 'best_final.png')
+        )
+
+    return best_sa, {
+        'ga_history':       ga_stats['fitness_history'],
+        'sa_history':       sa_history,
+        'combined_history': ga_stats['fitness_history'] + sa_history,
+        'ga_final_rmse':    ga_rmse,
+        'sa_final_rmse':    sa_rmse,
+    }
+
+
+def _save_hybrid_log(run_dir, ga_cfg, sa_cfg, ga_history, sa_history,
+                     ga_rmse, sa_rmse, runtime, best_repr=None):
+    from datetime import datetime as _dt
+    def _r(lst): return [round(v, 6) for v in lst]
+    log = {
+        'timestamp':        _dt.now().isoformat(),
+        'algorithm':        'hybrid_ga_then_sa',
+        'ga_config':        ga_cfg,
+        'sa_config':        sa_cfg,
+        'runtime_seconds':  round(runtime, 2),
+        'ga_final_rmse':    round(ga_rmse, 6),
+        'sa_final_rmse':    round(sa_rmse, 6),
+        'final_fitness':    round(sa_rmse, 6),
+        'ga_history':       _r(ga_history),
+        'sa_history':       _r(sa_history),
+        'n_ga_generations': len(ga_history),
+        'n_sa_cycles':      len(sa_history),
+    }
+    if best_repr is not None:
+        log['best_repr'] = list(best_repr)
+    with open(os.path.join(run_dir, 'log.json'), 'w') as f:
+        json.dump(log, f, indent=2)
+
+
+def load_or_run_hybrid(
+    label: str,
+    *,
+    solution_class,
+    ga_cfg: dict,
+    sa_cfg: dict,
+    verbose: bool = False,
+    reuse_existing: bool = True,
+    results_dir: str = 'results',
+):
+    """
+    Load the newest matching hybrid run from disk, or execute and persist it.
+
+    Mirrors load_or_run_ga — same calling convention, same return shape.
+
+    Returns
+    -------
+    solution, info, run_name, log, was_run : bool
+    """
+    from config import make_run_id
+
+    if reuse_existing:
+        run_name = find_latest_run(label, results_dir)
+        if run_name is not None:
+            log_path = os.path.join(results_dir, run_name, 'log.json')
+            if os.path.isfile(log_path):
+                with open(log_path) as f:
+                    log = json.load(f)
+                log['run_name'] = run_name
+                log['run_dir']  = os.path.join(results_dir, run_name)
+
+                repr_list = log.get('best_repr')
+                solution  = (solution_class(repr=list(repr_list))
+                             if repr_list is not None else None)
+
+                info = {
+                    'ga_history':       log.get('ga_history', []),
+                    'sa_history':       log.get('sa_history', []),
+                    'combined_history': log.get('ga_history', []) + log.get('sa_history', []),
+                    'ga_final_rmse':    log.get('ga_final_rmse'),
+                    'sa_final_rmse':    log.get('sa_final_rmse'),
+                }
+                return solution, info, run_name, log, False
+
+    run_name = make_run_id(label)
+    best, info = hybrid_ga_then_sa(
+        solution_class=solution_class,
+        ga_cfg=ga_cfg,
+        sa_cfg=sa_cfg,
+        run_id=run_name,
+        verbose=verbose,
+    )
+    log = None
+    log_path = os.path.join(results_dir, run_name, 'log.json')
+    if os.path.isfile(log_path):
+        with open(log_path) as f:
+            log = json.load(f)
+        log['run_name'] = run_name
+        log['run_dir']  = os.path.join(results_dir, run_name)
+
+    return best, info, run_name, log, True

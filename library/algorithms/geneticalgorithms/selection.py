@@ -10,6 +10,12 @@ Tournament selection is preferred for this project because:
 - RMSE values are small floats (typically 30–120); FPS with 1/fitness can
   introduce numerical instability when fitness values are very close.
 - Tournament selection pressure is easy to control via tournament_size.
+
+fitness_override parameter (tournament_selection only):
+    When fitness sharing is active, ga.py pre-computes a shared
+    fitness array and passes it here so selection uses the modified values
+    without touching the cached .fitness() on each Solution.  Pass None
+    (default) to use the normal cached fitness.
 """
 
 import random
@@ -17,7 +23,7 @@ from copy import deepcopy
 from library.problems.solution import Solution
 
 
-def fitness_proportionate_selection(population: list, maximization: bool):
+def fitness_proportionate_selection(population: list, maximization: bool, **kwargs):
     """
     Roulette-wheel (fitness proportionate) selection.
 
@@ -28,6 +34,7 @@ def fitness_proportionate_selection(population: list, maximization: bool):
     ----------
     population : list[Solution]
     maximization : bool
+    **kwargs : accepted but ignored (allows uniform call-site with tournament_selection)
 
     Returns
     -------
@@ -48,7 +55,12 @@ def fitness_proportionate_selection(population: list, maximization: bool):
     return deepcopy(population[-1])
 
 
-def tournament_selection(population: list, maximization: bool, tournament_size: int = 2):
+def tournament_selection(
+    population: list,
+    maximization: bool,
+    tournament_size: int = 2,
+    fitness_override: list = None,
+):
     """
     Tournament selection.
 
@@ -60,14 +72,21 @@ def tournament_selection(population: list, maximization: bool, tournament_size: 
     population : list[Solution]
     maximization : bool
     tournament_size : int  (default 2)
+    fitness_override : list[float] | None
+        If provided, must be the same length as population.  Selection is done
+        using these values instead of calling .fitness() on each individual.
+        Used by ga.py when fitness sharing is active.
 
     Returns
     -------
     Solution — a deep copy of the winner.
     """
-    tournament = random.choices(population, k=tournament_size)
-    if maximization:
-        winner = max(tournament, key=lambda ind: ind.fitness())
+    indices = random.choices(range(len(population)), k=tournament_size)
+
+    if fitness_override is not None:
+        key = lambda k: fitness_override[k]
     else:
-        winner = min(tournament, key=lambda ind: ind.fitness())
-    return deepcopy(winner)
+        key = lambda k: population[k].fitness()
+
+    winner_idx = (max if maximization else min)(indices, key=key)
+    return deepcopy(population[winner_idx])

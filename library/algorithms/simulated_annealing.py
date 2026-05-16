@@ -111,7 +111,18 @@ def simulated_annealing(
     runtime = time.time() - start_time
 
     if run_dir is not None:
-        _save_sa_log(run_dir, config or {}, fitness_history, runtime, best_ever_fitness)
+        final_img = best_ever.draw_image().astype(np.uint8)
+        Image.fromarray(final_img).save(
+            os.path.join(run_dir, f"step_{total_inner_steps:06d}_final.png")
+        )
+        _save_sa_log(
+            run_dir,
+            config or {},
+            fitness_history,
+            runtime,
+            best_ever_fitness,
+            best_repr=getattr(best_ever, "repr", None),
+        )
 
     if verbose:
         print(f"\nSA done. Best RMSE: {best_ever_fitness:.4f} | Total time: {runtime:.1f}s")
@@ -119,7 +130,7 @@ def simulated_annealing(
     return best_ever, fitness_history
 
 
-def _save_sa_log(run_dir, config, fitness_history, runtime, final_fitness):
+def _save_sa_log(run_dir, config, fitness_history, runtime, final_fitness, best_repr=None):
     log = {
         "timestamp": datetime.now().isoformat(),
         "algorithm": "simulated_annealing",
@@ -129,5 +140,7 @@ def _save_sa_log(run_dir, config, fitness_history, runtime, final_fitness):
         "fitness_history": [round(f, 6) for f in fitness_history],
         "n_outer_cycles": len(fitness_history),
     }
+    if best_repr is not None:
+        log["best_repr"] = list(best_repr)
     with open(os.path.join(run_dir, "log.json"), "w") as f:
         json.dump(log, f, indent=2)

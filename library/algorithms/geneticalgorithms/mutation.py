@@ -1,34 +1,42 @@
 """
 Mutation operators for the Triangle Image GA.
 
-Five operators are defined, each targeting a different aspect of the triangle
-representation.  They can be used individually or combined via "random" mode.
+Seven operator modes are supported.  The original five (vertex_shift,
+color_shift, alpha_shift, triangle_replace, triangle_swap) are unchanged in
+behaviour but now accept configurable step sizes.  Two new modes are added:
 
-Design rationale
-----------------
-- vertex_shift, color_shift, alpha_shift are *exploitation* operators: they
-  make small local improvements to existing triangles.
-- triangle_replace is an *exploration* operator: it escapes local optima by
-  completely randomising one triangle.
-- triangle_swap changes the rendering order (z-order) without changing any
-  triangle's intrinsic properties — useful when two triangles occlude each
-  other in a suboptimal order.
+    "geometric"  — box mutation: perturbs ALL 10 genes of a triangle
+                   atomically using type-specific step sizes.
+    "mixed"      — same as geometric but applies each gene type's own shift
+                   logic independently (vertex_shift per vertex gene,
+                   color_shift per RGB gene, alpha_shift per alpha gene).
 
-The "random" default mode picks uniformly from all five operators for each
-mutation event.  Experiment with individual modes in the notebook (Section 6)
-to understand their individual contributions.
+Two background innovation operators fire independently AFTER the main loop:
+
+    innovation_replace_prob  — per-triangle probability of full randomisation
+    zorder_swap_prob         — per-individual probability of one z-order swap
+
+Step sizes (vertex_step, color_step, alpha_step) default to 30, matching
+the original hardcoded ±30 behaviour.
 """
 
 import random
-from copy import deepcopy
 
 
 _GENES_PER_TRIANGLE = 10
 
 
-def triangle_mutation(individual, mut_prob: float,
-                      mutation_type: str = "random",
-                      verbose: bool = False):
+def triangle_mutation(
+    individual,
+    mut_prob: float,
+    mutation_type: str = "random",
+    verbose: bool = False,
+    vertex_step: int = 30,
+    color_step: int = 30,
+    alpha_step: int = 30,
+    innovation_replace_prob: float = 0.0,
+    zorder_swap_prob: float = 0.0,
+):
     """
     Apply per-triangle mutation to an individual.
 
@@ -40,14 +48,23 @@ def triangle_mutation(individual, mut_prob: float,
     individual : TriangleImageSolution
     mut_prob : float — probability that any given triangle is mutated.
     mutation_type : str — one of:
-        "vertex_shift"    small displacement of one vertex (±30 px)
-        "color_shift"     small change to one RGB channel (±30)
-        "alpha_shift"     small change to alpha / transparency (±30)
+        "vertex_shift"     small displacement of one vertex (±vertex_step px)
+        "color_shift"      small change to one RGB channel (±color_step)
+        "alpha_shift"      small change to alpha / transparency (±alpha_step)
         "triangle_replace" replace the entire triangle with a random one
-        "triangle_swap"   swap the z-order of two random triangles
-        "random"          choose uniformly from vertex_shift, color_shift,
-                          alpha_shift (exploitation-only; avoids destructive
-                          triangle_replace / triangle_swap)
+        "triangle_swap"    swap the z-order of two random triangles
+        "random"           choose uniformly from vertex_shift, color_shift,
+                           alpha_shift (exploitation-only)
+        "geometric"        box mutation — perturb ALL 10 genes atomically
+        "mixed"            geometric-style but applies each gene's own shift
+                           operator independently
+    vertex_step : int  — step size for vertex coordinate perturbations (default 30)
+    color_step  : int  — step size for RGB channel perturbations (default 30)
+    alpha_step  : int  — step size for alpha perturbations (default 30)
+    innovation_replace_prob : float — per-triangle probability of full randomisation
+                                      applied AFTER the main mutation loop
+    zorder_swap_prob        : float — per-individual probability of one z-order swap
+                                      applied AFTER the main mutation loop
     verbose : bool
 
     Returns
@@ -60,7 +77,7 @@ def triangle_mutation(individual, mut_prob: float,
 
     new_repr = individual.repr.copy()
 
-    _OPERATORS = ["vertex_shift", "color_shift", "alpha_shift"]
+    _EXPLOITATION_OPS = ["vertex_shift", "color_shift", "alpha_shift"]
 
     i = 0
     while i < n_triangles:
@@ -68,56 +85,56 @@ def triangle_mutation(individual, mut_prob: float,
             i += 1
             continue
 
-        # Select which operator to apply this event
-        op = random.choice(_OPERATORS) if mutation_type == "random" else mutation_type
+        op = random.choice(_EXPLOITATION_OPS) if mutation_type == "random" else mutation_type
 
+        # ── z-order swap (acts on two triangles, skip both) ──────────────────
         if op == "triangle_swap":
-            # Swap z-order of triangle i with another random triangle.
             j = random.randint(0, n_triangles - 1)
             if j == i:
                 j = (i + 1) % n_triangles
             base_i = i * _GENES_PER_TRIANGLE
             base_j = j * _GENES_PER_TRIANGLE
-            # Swap all 10 genes between triangle i and j
-            new_repr[base_i:base_i + _GENES_PER_TRIANGLE], \
-            new_repr[base_j:base_j + _GENES_PER_TRIANGLE] = \
-                new_repr[base_j:base_j + _GENES_PER_TRIANGLE], \
-                new_repr[base_i:base_i + _GENES_PER_TRIANGLE]
+            (new_repr[base_i:base_i + _GENES_PER_TRIANGLE],
+             new_repr[base_j:base_j + _GENES_PER_TRIANGLE]) = (
+                new_repr[base_j:base_j + _GENES_PER_TRIANGLE],
+                new_repr[base_i:base_i + _GENES_PER_TRIANGLE],
+            )
             if verbose:
                 print(f"triangle_swap: triangles {i} and {j} swapped z-order.")
-            # Skip j as well since we already mutated it
             i += 1
             continue
 
         base = i * _GENES_PER_TRIANGLE
 
+        # ── single-gene exploitation operators ───────────────────────────────
         if op == "vertex_shift":
             vertex = random.randint(0, 2)
             axis   = random.randint(0, 1)
             gene   = base + vertex * 2 + axis
             bound  = img_w if axis == 0 else img_h
-            delta  = random.randint(-30, 30)
+            delta  = random.randint(-vertex_step, vertex_step)
             new_repr[gene] = max(0, min(bound, new_repr[gene] + delta))
             if verbose:
-                print(f"vertex_shift: triangle {i}, vertex {vertex}, axis {'x' if axis==0 else 'y'}, delta={delta}")
+                print(f"vertex_shift: triangle {i}, vertex {vertex}, "
+                      f"axis {'x' if axis==0 else 'y'}, delta={delta}")
 
         elif op == "color_shift":
             channel = random.randint(0, 2)
             gene    = base + 6 + channel
-            delta   = random.randint(-30, 30)
+            delta   = random.randint(-color_step, color_step)
             new_repr[gene] = max(0, min(255, new_repr[gene] + delta))
             if verbose:
                 print(f"color_shift: triangle {i}, channel {['R','G','B'][channel]}, delta={delta}")
 
         elif op == "alpha_shift":
             gene  = base + 9
-            delta = random.randint(-30, 30)
+            delta = random.randint(-alpha_step, alpha_step)
             new_repr[gene] = max(0, min(255, new_repr[gene] + delta))
             if verbose:
                 print(f"alpha_shift: triangle {i}, delta={delta}")
 
+        # ── full replacement ─────────────────────────────────────────────────
         elif op == "triangle_replace":
-            # Completely randomise this triangle
             new_repr[base]     = random.randint(0, img_w)
             new_repr[base + 1] = random.randint(0, img_h)
             new_repr[base + 2] = random.randint(0, img_w)
@@ -131,6 +148,63 @@ def triangle_mutation(individual, mut_prob: float,
             if verbose:
                 print(f"triangle_replace: triangle {i} fully randomised.")
 
+        # ── geometric (box) mutation — all 10 genes atomically ──────────────
+        elif op == "geometric":
+            for j in range(6):   # vertex coordinates
+                bound = img_w if j % 2 == 0 else img_h
+                delta = random.randint(-vertex_step, vertex_step)
+                new_repr[base + j] = max(0, min(bound, new_repr[base + j] + delta))
+            for j in range(6, 9):   # RGB
+                delta = random.randint(-color_step, color_step)
+                new_repr[base + j] = max(0, min(255, new_repr[base + j] + delta))
+            delta = random.randint(-alpha_step, alpha_step)
+            new_repr[base + 9] = max(0, min(255, new_repr[base + 9] + delta))
+            if verbose:
+                print(f"geometric: triangle {i} all 10 genes perturbed.")
+
+        # ── mixed: per-gene independent operator logic on all 10 genes ───────
+        elif op == "mixed":
+            for j in range(6):
+                bound = img_w if j % 2 == 0 else img_h
+                delta = random.randint(-vertex_step, vertex_step)
+                new_repr[base + j] = max(0, min(bound, new_repr[base + j] + delta))
+            for j in range(6, 9):
+                delta = random.randint(-color_step, color_step)
+                new_repr[base + j] = max(0, min(255, new_repr[base + j] + delta))
+            delta = random.randint(-alpha_step, alpha_step)
+            new_repr[base + 9] = max(0, min(255, new_repr[base + 9] + delta))
+            if verbose:
+                print(f"mixed: triangle {i} all genes perturbed independently.")
+
         i += 1
+
+    # ── background innovation operators ──────────────────────────────────────
+    if innovation_replace_prob > 0.0:
+        for i in range(n_triangles):
+            if random.random() < innovation_replace_prob:
+                base = i * _GENES_PER_TRIANGLE
+                new_repr[base]     = random.randint(0, img_w)
+                new_repr[base + 1] = random.randint(0, img_h)
+                new_repr[base + 2] = random.randint(0, img_w)
+                new_repr[base + 3] = random.randint(0, img_h)
+                new_repr[base + 4] = random.randint(0, img_w)
+                new_repr[base + 5] = random.randint(0, img_h)
+                new_repr[base + 6] = random.randint(0, 255)
+                new_repr[base + 7] = random.randint(0, 255)
+                new_repr[base + 8] = random.randint(0, 255)
+                new_repr[base + 9] = random.randint(0, 255)
+                if verbose:
+                    print(f"background innovation_replace_prob: triangle {i} fully randomised.")
+
+    if zorder_swap_prob > 0.0 and random.random() < zorder_swap_prob:
+        i, j = random.sample(range(n_triangles), 2)
+        base_i, base_j = i * _GENES_PER_TRIANGLE, j * _GENES_PER_TRIANGLE
+        (new_repr[base_i:base_i + _GENES_PER_TRIANGLE],
+         new_repr[base_j:base_j + _GENES_PER_TRIANGLE]) = (
+            new_repr[base_j:base_j + _GENES_PER_TRIANGLE],
+            new_repr[base_i:base_i + _GENES_PER_TRIANGLE],
+        )
+        if verbose:
+            print(f"background zorder_swap_prob: triangles {i} and {j} z-order swapped.")
 
     return individual.with_repr(new_repr)

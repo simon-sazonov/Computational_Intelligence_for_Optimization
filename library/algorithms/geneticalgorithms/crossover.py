@@ -24,6 +24,54 @@ from copy import deepcopy
 _GENES_PER_TRIANGLE = 10
 
 
+def block_triangle_crossover(parent1, parent2, crossover_prob: float, verbose: bool = False):
+    """
+    Block triangle crossover — z-order-aware.
+
+    Inherits a contiguous block of triangle z-positions [a, b) from one parent
+    and the rest from the other.  Unlike uniform crossover (which independently
+    assigns each triangle slot), this preserves z-order coherence within each
+    inherited block — relevant for alpha-blending epistasis where the rendering
+    order of a group of semi-transparent triangles matters.
+
+    offspring1 = parent2's triangles with block [a,b) replaced by parent1's
+    offspring2 = parent1's triangles with block [a,b) replaced by parent2's
+
+    Parameters
+    ----------
+    parent1, parent2 : TriangleImageSolution
+    crossover_prob : float
+    verbose : bool
+
+    Returns
+    -------
+    (offspring1, offspring2) : tuple[TriangleImageSolution, TriangleImageSolution]
+    """
+    n_triangles = len(parent1.repr) // _GENES_PER_TRIANGLE
+
+    if random.random() > crossover_prob:
+        if verbose:
+            print("No crossover — returning copies of parents.")
+        return deepcopy(parent1), deepcopy(parent2)
+
+    a = random.randint(0, n_triangles - 2)
+    b = random.randint(a + 1, n_triangles)
+
+    repr1 = parent2.repr.copy()
+    repr1[a * _GENES_PER_TRIANGLE: b * _GENES_PER_TRIANGLE] = \
+        parent1.repr[a * _GENES_PER_TRIANGLE: b * _GENES_PER_TRIANGLE]
+
+    repr2 = parent1.repr.copy()
+    repr2[a * _GENES_PER_TRIANGLE: b * _GENES_PER_TRIANGLE] = \
+        parent2.repr[a * _GENES_PER_TRIANGLE: b * _GENES_PER_TRIANGLE]
+
+    if verbose:
+        print(f"Block crossover: block [{a}, {b}) "
+              f"(genes {a*_GENES_PER_TRIANGLE}–{b*_GENES_PER_TRIANGLE-1}).")
+
+    return parent1.with_repr(repr1), parent2.with_repr(repr2)
+
+
 def uniform_triangle_crossover(parent1, parent2, crossover_prob: float, verbose: bool = False):
     """
     Uniform triangle crossover.

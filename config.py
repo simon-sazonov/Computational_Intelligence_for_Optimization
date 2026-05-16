@@ -1,112 +1,89 @@
 """
-Central configuration file for all hyperparameters.
+Central configuration — single source of truth for all hyperparameters.
 
-Change values here before running the notebook — no need to touch algorithm code.
-Each run automatically saves these values into its results/run_<id>/log.json
-so you can always reconstruct exactly which config produced which result.
+The pipeline flows left to right through this file:
+  GA_CONFIG  →  OAT grids  →  OPTUNA_SEARCH_SPACE  →  OPTUNA_BEST_CONFIG
+             →  LAYER2/3 overrides  →  FINAL_BEST_CONFIG
 
-Experiment guide
-----------------
-To compare two configs:
-  1. Edit GA_CONFIG to the first config and run the GA cell in the notebook.
-  2. Edit GA_CONFIG to the second config and run again.
-  Both runs are saved to different results/ folders and load_all_runs()
-  will return both for comparison plotting.
-
-Recommended experiments (vary ONE parameter at a time, keep others at baseline):
-
-  population_size   : [10, 20, 30, 50, 100]
-  elitesize         : [0, 1, 2, 5]
-  mut_prob          : [0.01, 0.03, 0.05, 0.1, 0.2]
-  xo_prob           : [0.5, 0.7, 0.9]
-  crossover_type    : ["uniform", "single_point"]
-  mutation_type     : ["vertex_shift", "replace", "random"]
-  tournament_size   : [2, 3, 5]
-
-  SA C (temperature): [1.0, 5.0, 20.0, 100.0]
-  SA H (cooling)    : [1.02, 1.05, 1.1, 1.2]
-  SA L (inner steps): [10, 50, 100, 200]
+Nothing is computed here; only values are declared.
 """
 
-import time
+from datetime import datetime
 
-# ── GA baseline configuration (used in Section 5) ─────────────────────────────
+
+# ── Baseline (un-tuned starting point, used in Sections 5–6) ──────────────────
 GA_CONFIG = {
-    "population_size"   : 30,
-    "max_generations"   : 1000,
-    "xo_prob"           : 0.8,
-    "mut_prob"          : 0.05,
-    "elitesize"         : 2,
-    "tournament_size"   : 3,
-    "crossover_type"    : "uniform",      # "uniform" | "single_point"
-    "mutation_type"     : "random",       # "vertex_shift" | "color_shift" | "alpha_shift"
-                                          # | "triangle_replace" | "triangle_swap" | "random"
-    "maximization"      : False,          # RMSE is minimised
-    "save_image_every_n_gens": 100,       # save PNG snapshot every N generations
+    'population_size': 30,
+    'max_generations': 1000,
+    'tournament_size': 3,
+    'elitesize': 1,
+    'xo_prob': 0.8,
+    'mut_prob': 0.05,
+    'crossover_type': 'uniform',
+    'mutation_type': 'random',
+    'maximization': False,
+    'track_diversity': True,         # ALWAYS on — diagnostic is free
+    'save_image_every_n_gens': 100,
 }
 
-# ── Best configuration (OAT experiments → Section 9 extended run) ─────────────
-# pop=50: more diversity, better recombination
-# elite=1: prevents backsliding without reducing population diversity
-# single_point XO: preserves z-order co-adaptation between triangles
-# mut_prob=0.05: confirmed sweet spot in Experiment C
-BEST_CONFIG = {
-    "population_size"   : 50,
-    "max_generations"   : 3000,
-    "xo_prob"           : 0.8,
-    "mut_prob"          : 0.05,
-    "elitesize"         : 1,
-    "tournament_size"   : 3,
-    "crossover_type"    : "single_point",
-    "mutation_type"     : "random",
-    "maximization"      : False,
-    "save_image_every_n_gens": 300,
-}
-
-# ── SA configuration (for Challenge 2 comparison) ─────────────────────────────
-# Equal evaluation budget: GA uses population_size × max_generations evaluations.
-# SA uses L × max_iter evaluations in its inner loop.
-# Default: 30 × 1000 = 30,000 for GA  →  L=150 × max_iter=200 = 30,000 for SA.
+# ── SA config for Challenge 2 (Section 9) ────────────────────────────────────
 SA_CONFIG = {
-    "C"                 : 10.0,   # initial temperature
-    "L"                 : 150,    # inner iterations per temperature cycle
-    "H"                 : 1.05,   # cooling rate (C = C/H each outer loop)
-    "max_iter"          : 200,    # outer loops  → total inner steps = L × max_iter
-    "maximization"      : False,
-    "save_every_n_steps": 1500,   # save PNG snapshot every N inner steps
+    'C': 20.0, 'L': 150, 'H': 1.05,
+    'max_iter': 200,                 # 150 × 200 = 30,000 = GA budget
+    'save_every_n_steps': 1000,
 }
 
-
-def make_run_id(prefix: str = "run") -> str:
-    """Generate a unique run ID based on current timestamp."""
-    return f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}"
-
-
-# ── Optuna search space (populated by Section 6 range-derivation cell) ────────
-# Each entry has type ("int" | "float" | "categorical") and bounds/choices.
-# The numeric bounds (low/high) are None until the Section 6 closing cell runs
-# and derives them from the OAT experiment results automatically.
-OPTUNA_SEARCH_SPACE =  { "population_size": {"type": "int",         "low": 10, "high": 50},
-    "tournament_size": {"type": "int",         "low": 2, "high": 6},
-    "mut_prob":        {"type": "float",       "low": 0.01, "high": 0.1},
-    "xo_prob":         {"type": "float",       "low": 0.5, "high": 1.0},
-    "elitesize":       {"type": "int",         "low": 0, "high": 5},
-    "crossover_type":  {"type": "categorical", "choices": ["uniform", "single_point"]},
-    "mutation_type":   {"type": "categorical", "choices": ["random", "vertex_shift",
-                                                            "color_shift", "alpha_shift"]},
+# ── SA config for Section 10 hybrid GA → SA refinement ───────────────────────
+# Lower C (start closer to GA's optimum) and faster cooling (H higher).
+# Budget: L × max_iter = 100 × 60 = 6,000 evals ≈ 20% of 30,000 total.
+HYBRID_SA_CONFIG = {
+    'C': 10.0, 'L': 100, 'H': 1.05,
+    'max_iter': 60,                  # 100 × 60 = 6,000 evals — higher C lets SA escape GA's local minimum
+    'save_every_n_steps': 500,
 }
 
-# ── Optuna-optimized configuration (filled in by Section 7 notebook cell) ─────
-# Replaces BEST_CONFIG as the canonical best parameters for all later sections.
-OPTUNA_BEST_CONFIG = {
-    "population_size"        : 40,
-    "max_generations"        : 1000,
-    "xo_prob"                : 0.8557,
-    "mut_prob"               : 0.0518,
-    "elitesize"              : 0,
-    "tournament_size"        : 5,
-    "crossover_type"         : "uniform",
-    "mutation_type"          : "random",
-    "maximization"           : False,
-    "save_image_every_n_gens": 100,
+# ── Section 6 OAT experiment grids ───────────────────────────────────────────
+EXPERIMENT_A_POPULATION = [10, 20, 50]
+EXPERIMENT_B_ELITE      = [0, 1, 5]
+EXPERIMENT_C_MUTRATE    = [0.01, 0.05, 0.1, 0.2]
+EXPERIMENT_D_CROSSOVER  = ['uniform', 'single_point']
+EXPERIMENT_E_MUTTYPE    = ['vertex_shift', 'triangle_replace', 'random']
+EXPERIMENT_F_TOURNAMENT = [2, 3, 4, 5, 6]
+EXPERIMENT_G_XOPROB     = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+EXPERIMENT_H_INVERTED   = [
+    {'mut_prob': 0.10, 'xo_prob': 0.6},
+    {'mut_prob': 0.15, 'xo_prob': 0.6},
+    {'mut_prob': 0.20, 'xo_prob': 0.5},
+]
+EXPERIMENT_I_STEPSIZE   = [
+    {'vertex_step': 10, 'color_step': 15, 'alpha_step': 15},
+    {'vertex_step': 30, 'color_step': 30, 'alpha_step': 30},   # default
+    {'vertex_step': 50, 'color_step': 80, 'alpha_step': 50},
+]
+
+# ── Optuna search space (filled by Section 6 derivation cell) ─────────────────
+OPTUNA_SEARCH_SPACE = {'population_size': {'type': 'int', 'low': 30, 'high': 80}, 'tournament_size': {'type': 'int', 'low': 3, 'high': 6}, 'mut_prob': {'type': 'float', 'low': 0.03, 'high': 0.12}, 'xo_prob': {'type': 'float', 'low': 0.85, 'high': 1.0}, 'elitesize': {'type': 'int', 'low': 2, 'high': 8}, 'crossover_type': {'type': 'categorical', 'choices': ['uniform', 'single_point']}, 'mutation_type': {'type': 'categorical', 'choices': ['random', 'vertex_shift', 'triangle_replace']}, 'vertex_step': {'type': 'int', 'low': 30, 'high': 60}, 'color_step': {'type': 'int', 'low': 30, 'high': 100}, 'alpha_step': {'type': 'int', 'low': 30, 'high': 60}}
+OPTUNA_BEST_CONFIG = {'population_size': 66, 'max_generations': 1000, 'tournament_size': 6, 'elitesize': 6, 'xo_prob': 0.9862861192072796, 'mut_prob': 0.052665809643785456, 'crossover_type': 'uniform', 'mutation_type': 'vertex_shift', 'maximization': False, 'track_diversity': True, 'save_image_every_n_gens': 100, 'vertex_step': 50, 'color_step': 66, 
+                      'alpha_step': 41}
+
+# ── Section 8 structural improvement overrides ────────────────────────────────
+LAYER2_GEOMETRIC       = {'mutation_type': 'geometric'}
+LAYER2_REPLACE         = {'innovation_replace_prob': 0.02}
+LAYER2_SWAP            = {'zorder_swap_prob': 0.01}
+LAYER3_FITNESS_SHARING = {'fitness_sharing': True, 'sigma_share': 0.1}
+LAYER3_DYNAMIC         = {
+    'dynamic_schedule': True,
+    'mut_prob_start': 0.15, 'mut_prob_end': 0.03,
+    'tournament_start': 2,  'tournament_end': 5,
 }
+
+# ── Final combined config (filled after Section 8.6 picks winner) ─────────────
+FINAL_BEST_CONFIG = {'population_size': 66, 'max_generations': 1000, 'tournament_size': 6, 'elitesize': 6, 'xo_prob': 0.9862861192072796, 'mut_prob': 0.052665809643785456, 'crossover_type': 'uniform', 'mutation_type': 'vertex_shift', 'maximization': False, 'track_diversity': True, 'save_image_every_n_gens': 100, 'vertex_step': 50, 'color_step': 66, 'alpha_step': 41, 'zorder_swap_prob': 0.01}  # OPTUNA_BEST_CONFIG + LAYER2_SWAP; 8.7 winner: 24.3291 vs Optuna 24.4738
+
+
+
+
+
+
+def make_run_id(label):
+    return f"{label}_{datetime.now():%Y%m%d_%H%M%S}"
